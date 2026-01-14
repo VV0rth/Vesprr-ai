@@ -5,6 +5,7 @@ import pty
 import sys
 import re
 import os
+import select
 from ollama import chat
 from ollama import ChatResponse
 from termcolor import cprint
@@ -18,7 +19,9 @@ RESET = "\033[0m"
 
 # Linux environment variables
 shell = (os.environ.get('SHELL')).split("/")[-1]
+shell = "zsh"
 ollama_first = ((subprocess.run (["ollama", "list"], capture_output=True, text=True)).stdout).split("\n")[1].split()[0]
+ollama_first = "gpt-oss:20b-16k"
 distro = ((subprocess.run (["cat", "/etc/os-release"], capture_output=True, text=True)).stdout).split("\n")[0].split("=")[1].replace('"', '')
 
 def highlight_fish_command(cmd: str) -> str:
@@ -58,11 +61,16 @@ def highlight_fish_command(cmd: str) -> str:
 
 	return " ".join(highlighted)
 
-def get_response(prompt):
+def get_initial_response(prompt):
 	# Build a single message string including instructions and the logs
 	user_prompt = (
 		f"""
 Below is a request from a user in search of the correct {shell} command in {distro} based system. please respond with only the correct command without any additional text or characters. Assume your response will be run exactly as outputted in a {shell} terminal.
+Please keep in mind the user might me looking for multiple commands that require more than one step to complete. In that case, provide ONLY the first command needed to start the process. DO NOT attempt to pipe commands together unless you are absolutely certain it is a single step process.
+Do NOT output commands that require user input during execution, including but not limited to "read", "select", "vim", "nano", "top", etc.
+Attempt to run the process with no user interaction required.
+Do not assume the user knows specific details about their system so be sure to verify details like file paths, file names, package names, service names, etc. before including them in your response.
+attempt to learn about the environment before providing commands. especially after errors.
 User Request: {prompt}
 """
 	)
@@ -90,24 +98,225 @@ command :{cmd}
 		return True
 	return False
 
-# def continue_execution(cmd, query, output):
-# 	response = ""
-# 	while "yes" not in response.lower():
+def run_and_capture(command):
+	output = b""
 
+	pid, fd = pty.fork()
 
+	if pid == 0:
+		# Child process
+		os.execvp(shell, [shell, "-i", "-c", command])
+	else:
+		# Parent process
+		while True:
+			r, _, _ = select.select([fd], [], [], 0.1)
+			if fd in r:
+				try:
+					data = os.read(fd, 1024)
+					if not data:
+						break
+					print(data.decode(), end="", flush=True)  # still show it live
+					output += data
+				except OSError:
+					break
+
+		return output.decode(errors="replace")
+
+def check_command_is_done(hist):
+	# Build a single message string including instructions and the logs
+	user_prompt = (
+		f"""
+below is a conversation between an AI and a user using a {shell} shell in a {distro} based system. please respond with only "yes" if the conversation is complete and the user is satisfied, or "no" if the user is still seeking further assistance. Assume your response will be read exactly as outputted. respond with only yes or no.
+Conversation:
+{hist}
+"""
+	)
+	messages = [{"role": "user", "content": user_prompt},]
+	response: ChatResponse = chat(model=ollama_first, messages=messages)
+
+	# Print the mapped content field from the response object
+	yn = response.message.content
+	if "yes" in yn.lower():
+		return True
+	return False
+
+def next_step_response(hist,og_prompt):
+	# Build a single message string including instructions and the logs
+	user_prompt = (
+		f"""
+Below is a conversation from a user in search of the next {shell} command in {distro} based system. please respond with only the correct command without any additional text or characters. Assume your response will be run exactly as outputted in a {shell} terminal.
+Please keep in mind the user might me looking for multiple commands that require more than one step to complete. In that case, provide ONLY the next command needed to continue the process. DO NOT attempt to pipe commands together unless you are absolutely certain it is a single step process.
+Attempt to run the process with no user interaction required.
+Do not assume the user knows specific details about their system so be sure to verify details like file paths, file names, package names, service names, etc. before including them in your response.
+attempt to learn about the environment before providing commands. especially after errors.
+Conversation History:
+{hist}
+Original User Request:
+{og_prompt}
+if previously provided command was incorrect or produced an error, provide a DIFFERENT command LIKELY to succeed. 
+"""
+	)
+	messages = [{"role": "user", "content": user_prompt},]
+	response: ChatResponse = chat(
+		model=ollama_first,
+		messages=messages,
+		think=True)
+	if "'" in response.message.content[0] or '"' in response.message.content[0] or "`" in response.message.content[0]:
+		return response.message.content[1:-1]
+	# Print the mapped content field from the response object
+	return response.message.content
+
+def summarize_output(hist):
+	# Build a single message string including instructions and the logs
+	user_prompt = (
+		f"""Below is the conversation history between a YOU and a user running a {shell} shell in a {distro} based system. Please provide a concise summary of the actions taken by you (AI) so far and their results. No more than 1-2 sentences. speculate on the next steps YOU might want to take based on the output provided.
+Attempt to run the process with no user interaction required.
+Do not assume the user knows specific details about their system so be sure to verify details like file paths, file names, package names, service names, etc. before including them in your response.
+attempt to learn about the environment before providing commands. especially after errors. Do not restate your instructions or things already known. Be very very concise.
+Conversation History:
+{hist}
+""")
+	stream = chat(
+		model=ollama_first,
+		messages=[{'role': 'user', 'content': user_prompt}],
+		stream=True,
+	)
+
+	in_thinking = False
+	content = ''
+	thinking = ''
+	for chunk in stream:
+		if chunk.message.thinking:
+			if not in_thinking:
+				in_thinking = True
+				print('Thinking:\n', end='', flush=True)
+			print(chunk.message.thinking, end='', flush=True)
+			# accumulate the partial thinking 
+			thinking += chunk.message.thinking
+		elif chunk.message.content:
+			if in_thinking:
+				in_thinking = False
+				print('\n\nAnswer:\n', end='', flush=True)
+			print(chunk.message.content, end='', flush=True)
+			# accumulate the partial content
+			content += chunk.message.content
+
+	# append the accumulated fields to the messages for the next request
+	new_messages = [{ 'role': 'assistant', thinking: thinking, content: content }]
+	return (content)
+
+def speculate_first(hist):
+	# Build a single message string including instructions and the logs
+	user_prompt = (
+		f"""Below is a request from a user in search of the correct {shell} command in {distro} based system. Please provide a speculation of the next steps YOU might want to take based on the output provided. No more than 1-2 sentences. If the request requires an initial understanding of the environment, provide that speculation first. and attempt to plan out your steps.
+keep in mind you are an AI assistant helping the user, and you will be the one running the commands. Speak to the user in a way that helps them understand your thought process, but structure your response in a human friendly way.
+Conversation History:
+{hist}
+""")
+	stream = chat(
+		model=ollama_first,
+		messages=[{'role': 'user', 'content': user_prompt}],
+		stream=True,
+	)
+
+	in_thinking = False
+	content = ''
+	thinking = ''
+	for chunk in stream:
+		if chunk.message.thinking:
+			if not in_thinking:
+				in_thinking = True
+				print('Thinking:\n', end='', flush=True)
+			print(chunk.message.thinking, end='', flush=True)
+			# accumulate the partial thinking 
+			thinking += chunk.message.thinking
+		elif chunk.message.content:
+			if in_thinking:
+				in_thinking = False
+				print('\n\nAnswer:\n', end='', flush=True)
+			print(chunk.message.content, end='', flush=True)
+			# accumulate the partial content
+			content += chunk.message.content
+
+	# append the accumulated fields to the messages for the next request
+	new_messages = [{ 'role': 'assistant', thinking: thinking, content: content }]
+	return (content + "\nAI@Assistant:\n")
+
+	
+
+#assign user input
+user_input = sys.argv[1:]
+print()
+
+conversation_history = f"""User: {" ".join(user_input)}
+
+Assistant: """
 
 if __name__ == "__main__":
-	user_input = sys.argv[1:]
-	print()
+	#display prompt and get command from ollama
+	conversation_history += speculate_first(conversation_history)
+	print ()
 	cprint(f"AIagent@{ollama_first.split(":")[0]}$ ", 'magenta', end="", flush=True)
-	command = (get_response(f"""{user_input}"""))
+	command = (get_initial_response(f"""{user_input}"""))
+	
+	#add command to conversation history
+	conversation_history += f"{command}\n"
+	#highlight and print command
 	print (highlight_fish_command(command), end ="", flush=True)
+
+	#check command safety with ollama
 	if not check_command_danger(command):
 		check = input(" (Press Enter to run)")
+		#run command in pty if user confirms and stores output in out
 		if check == "":
-			pty.spawn ([shell, "-i", "-c", command])
+			conversation_history += run_and_capture(command)
+		#exit if user does anything else
 		else:
 			sys.exit
+
+	#run command in pty if deemed safe
 	else:
 		print()
-		pty.spawn ([shell, "-i", "-c", command])
+		conversation_history += run_and_capture(command)
+	
+	#final check if user needs more assistance
+	while not check_command_is_done(conversation_history):
+		#summarize the conversation history
+		print ()
+		cprint ("Thinking...", 'grey', end="\r", flush=True)
+		
+		#Set csummery to summary of conversation history and print it for user
+		csummery = (summarize_output(conversation_history))
+
+		conversation_history += f"\nAI@Assistant: {csummery}\n"
+		#get next step command from ollama
+		cprint(f"\nAIagent@{ollama_first.split(':')[0]}$ ", 'magenta', end="", flush=True)
+		next_command = next_step_response(conversation_history, user_input)
+
+		#add command to conversation history
+		conversation_history += f"\nAI@Assistant$ {next_command}\n"
+		#highlight and print command
+		print (highlight_fish_command(next_command), end ="", flush=True)
+
+		#check command safety with ollama
+		if not check_command_danger(next_command):
+			check = input(" (Press Enter to run)")
+			#run command in pty if user confirms and stores output in out
+			if check == "":
+				conversation_history += run_and_capture(next_command)
+			#exit if user does anything else
+			else:
+				sys.exit
+		#run command in pty if deemed safe
+		else:
+			print()
+			conversation_history += run_and_capture(next_command)
+	
+	#final summary of conversation
+	
+
+	print ("")
+	cprint (summarize_output(conversation_history), 'light_grey')
+	print()
+	cprint("Conversation History:", 'cyan')
+	print(conversation_history)
